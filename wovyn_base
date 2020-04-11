@@ -1,0 +1,105 @@
+ruleset wovyn_base {
+  meta {
+    shares __testing, getName
+    use module sensor_profile
+    use module temperature_store
+    use module io.picolabs.wrangler alias Wrangler
+    use module io.picolabs.subscription alias Subscription
+  }
+  
+  global {
+    
+    __testing = { "queries": [ { "name": "__testing" } ],
+                  "events": [ 
+                              { "domain": "post", "type": "test", "attrs": [ "temp", "baro" ] },
+                              {"domain": "wovyn", "type": "heartbeat", "attrs": ["genericThing"] },
+                              {"domain": "wovyn", "type": "test_heartbeat", "attrs": ["temperature"] },
+                              // {"domain": "wovyn", "type": "new_temperature_reading", "attrs": ["temperature"] }
+                            ]
+                }
+                
+                
+    getName = function(){
+      Wrangler:name()
+    }
+  }
+ 
+  rule process_heartbeat {
+    select when wovyn heartbeat where event:attr("genericThing")
+    pre {
+      // never_used = event:attrs.klog("attrs")
+      data = event:attr("genericThing").decode()
+      uuid = random:uuid()
+    }
+    
+    always {
+        raise wovyn event "new_temperature_reading" attributes { "temperature": data{"data"}{"temperature"}[0]{"temperatureF"}, "timestamp": time:now(), "uuid": uuid }
+      }
+  }
+  
+  
+  rule test_process_heartbeat {
+    select when wovyn test_heartbeat
+    pre {
+      uuid = random:uuid()
+    }
+
+    always {
+      raise wovyn event "new_temperature_reading" attributes { "temperature":event:attr("temperature"), "timestamp":time:now(), "uuid": uuid }
+    }
+  }
+  
+  
+  rule find_high_temps {
+    select when wovyn new_temperature_reading
+    pre {
+      temperature = event:attr("temperature").klog("received temp:")
+      time = event:attr("timestamp")
+      uuid = event:attr("uuid")
+      threshold = sensor_profile:get_threshold()
+    }
+    if temperature > threshold then 
+    send_directive("temperature violation", {"temperature":temperature.klog("temperature violation:")})
+    fired {
+      raise wovyn event "threshold_violation" attributes { "temperature": temperature, "timestamp": time, "uuid": uuid }
+    }
+  }
+  
+  rule threshold_notification {
+    select when wovyn threshold_violation
+    
+    pre {
+      controllerPicoECI = Subscription:established("Tx_role", "controller").head(){"Tx"}.klog("Controller ECI")
+    }
+    
+    event:send({"eci": controllerPicoECI, "domain": "sensor", "type": "threshold_violation", "attrs": event:attrs.put("name", Wrangler:name())})
+
+    
+  }
+  
+  
+  
+  rule autoAcceptSubscriptions {
+    select when wrangler inbound_pending_subscription_added
+    always {
+      raise wrangler event "pending_subscription_approval" attributes event:attrs; // Simplified and idiomatic subscription acceptance
+    }
+  }
+  
+  
+  
+  // -----------------------------------------------------
+  // Lab 8: Report Generating rules
+  // -----------------------------------------------------
+  rule acceptReportRequest {
+    select when reports request_report
+    pre {
+      rcn = event:attr("rcn")
+      controllerPicoECI = Subscription:established("Tx_role", "controller").head(){"Tx"}.klog("Controller ECI")
+      temperatures = temperature_store:temperatures()
+    }
+    
+    event:send({"eci": controllerPicoECI, "domain": "reports", "type": "sensor_report_response", "attrs": {"name": Wrangler:name(), "temperatures": temperatures, "rcn": rcn}})
+  }
+}
+

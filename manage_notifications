@@ -1,0 +1,54 @@
+ruleset manage_notifications {
+  meta {
+    shares __testing, notification_phone
+  }
+  global {
+    __testing = { "queries":
+      [ { "name": "__testing" },
+        { "name": "notification_phone" }
+      ] , "events":
+      [ //{ "domain": "d1", "type": "t1" }
+      //, { "domain": "d2", "type": "t2", "attrs": [ "a1", "a2" ] }
+      ]
+    }
+    
+    notification_phone = "+19518582052"
+    from_phone = "+19514206936"
+  }
+  
+  
+  
+  rule threshold_notification {
+    select when sensor threshold_violation
+    
+    pre {
+      temperature = event:attr("temperature").klog("thresholdNotification:")
+      timestamp = event:attr("timestamp")
+      attrs = event:attrs.klog("Event attributes!!!!!")
+      message = "Sensor "+ attrs{"name"} +" is over-temperature ("+temperature+" degrees)"
+    }
+    
+    send_directive("threshold violation: THE REACTOR CORE WILL MELT DOWN!!")
+    
+    fired {
+      raise test event "new_message" for "twilio_app" attributes {"to": notification_phone, "from": from_phone, "message": message}
+    }
+    
+  }
+  
+  
+  rule report_ready_notification {
+    select when reports notify_report_ready
+    pre {
+      message = "The report you requested is ready.  You can view it on the Pico Engine dashboard."
+    }
+    
+    fired {
+      raise test event "new_message" for "twilio_app" attributes {"to": notification_phone, "from": from_phone, "message": message}
+    }
+  }
+  
+  
+  
+}
+

@@ -1,0 +1,265 @@
+ruleset manage_sensors_lab8 {
+  meta {
+    shares __testing, sensors, all_temperatures, reportResponses, recent_reports
+    // provides sensors, all_temperatures
+    use module io.picolabs.wrangler alias Wrangler
+    use module io.picolabs.subscription alias Subscription
+  }
+  global {
+    __testing = { "queries": [ 
+        { "name": "__testing" },
+        { "name": "sensors" },
+        { "name": "all_temperatures" },
+        { "name": "reportResponses" },
+        { "name": "recent_reports" },
+      ] , "events": [ 
+        { "domain": "sensor", "type": "subscribe", "attrs": ["eci"] },
+        { "domain": "reports", "type": "request_report" },
+        { "domain": "sensor", "type": "new_sensor", "attrs": ["name"] },
+        { "domain": "sensor", "type": "unneeded_sensor", "attrs": ["name"] }
+      ]
+    }
+    
+    default_temperature_threshold = 100
+    default_phone = "+19518582052"
+    
+    sensors = function(){
+      sensors = Subscription:established("Tx_role", "sensor")
+      sensors.map(function(v,k){
+        eci = v{"Tx"}
+        picoName = Wrangler:skyQuery(eci, "wovyn_base", "getName")
+        obj = {}.put(picoName, v)
+        obj
+      })
+    }
+    
+    all_temperatures = function(){
+      sensors = Subscription:established("Tx_role", "sensor")
+      sensors.map(function(v,k){
+        eci = v{"Tx"}
+        temps = Wrangler:skyQuery(eci, "temperature_store", "temperatures")
+        picoName = Wrangler:skyQuery(eci, "wovyn_base", "getName")
+        obj = {}.put(picoName, temps)
+        obj
+      })
+    }
+    
+    
+    reportResponses = function(){
+      ent:reportResponses
+    }
+    
+    
+    recent_reports = function(){
+      length = ent:reports.length()
+      
+      reports = length > 5
+        => ent:reports.slice(length-5, length-1)
+        | ent:reports
+        
+      reports.reverse()
+    }
+    
+  }
+  
+  
+  
+  
+  rule create_sensor {
+    select when sensor new_sensor
+    pre {
+      name = event:attr("name")
+      exists = ent:sensors >< name
+    }
+    
+    if not exists then noop()
+
+    fired {
+      
+      raise wrangler event "child_creation"
+        attributes { "name": name, "color": "#ffff00", "rids": ["temperature_store", "sensor_profile", "wovyn_base"] }
+    }
+  }
+  
+  
+  
+  
+  rule sensor_already_exists {
+    select when sensor new_sensor
+    pre {
+      name = event:attr("name")
+      eci = meta:eci
+      exists = ent:sensors >< name
+    }
+    
+    if exists then
+      send_directive("Sensor Already Ready", {"name": name})
+  }
+  
+  
+  
+  
+  rule store_new_sensor {
+    select when wrangler child_initialized
+    pre {
+      name = event:attr("name").klog()
+      sensorObj = {"eci": event:attr("eci")}
+    }
+    
+    if sensorObj then 
+    event:send({
+      "eci": sensorObj{"eci"}.klog("ECI:"),
+      "domain": "sensor",
+      "type": "profile_updated",
+      "attrs": {
+        "name": name, 
+        "location": "", 
+        "threshold": default_temperature_threshold, 
+        "phone": default_phone
+      }
+    })
+    
+    fired {
+      ent:sensors := ent:sensors.defaultsTo({})
+      ent:sensors{[name]} := sensorObj.klog("Saving new child info for " + name + ":")
+      
+      // Request Subscription
+      raise sensor event "subscribe" attributes event:attrs
+      
+    } else {
+      name = name.klog("Child info not saved")
+    }
+  }
+  
+  
+  
+  // -------------------------------------------
+  // Requests a subscription to a sensor pico
+  // -------------------------------------------
+  rule subscribe_to_sensor {
+    select when sensor subscribe
+    always {
+      raise wrangler event "subscription" attributes
+      { 
+        "Rx_role": "controller",
+        "Tx_role": "sensor",
+        "channel_type": "subscription",
+        "wellKnown_Tx" : event:attr("eci")
+      }
+    }
+  }
+  
+  
+  
+  
+  rule print_init {
+    select when wrangler child_initialized
+    pre {
+      name = event:attr("name").klog()
+      sensorObj = {"eci": event:attr("eci")}
+    }
+    if sensorObj then send_directive("Here's the child's ECI and stuff:", event:attrs)
+  }
+  
+  
+  
+  
+  rule delete_sensor {
+    select when sensor unneeded_sensor
+    pre {
+      name = event:attr("name")
+    }
+    
+    if name then send_directive("Deleting sensor", {"name": name})
+    
+    fired {
+      raise wrangler event "child_deletion" attributes {"name": name}
+      ent:sensors := ent:sensors.delete([name])
+    }
+  }
+  
+  
+  
+  
+  
+  // -----------------------------------------------------
+  // Lab 8: Report Generating rules
+  // -----------------------------------------------------
+  rule request_temperature_report_guard {
+    select when reports request_report
+    
+    pre {
+      rcn = random:uuid()
+    }
+    fired {
+      raise reports event "process_report_request" attributes {"rcn": rcn}
+      schedule reports event "report_complete" at time:add(time:now(), {"minutes": 1}) attributes {"rcn": rcn}
+    }
+  }
+  
+  
+  rule process_temperature_report_request {
+    select when reports process_report_request
+    
+    foreach Subscription:established("Tx_role", "sensor") setting (sensor)
+    pre {
+      eci = sensor{"Tx"}
+      rcn = event:attr("rcn")
+    }
+    
+    event:send({"eci": eci, "domain": "reports", "type": "request_report", "attrs": {"rcn": rcn}})
+    
+    fired {
+      ent:reportResponses := ent:reportResponses.defaultsTo({}).put(rcn, {"reportSent": false, "Temperatures": {}})
+    }
+  }
+  
+  
+  rule catch_report_response {
+    select when reports sensor_report_response
+    pre {
+      rcn = event:attr("rcn")
+      sensorName = event:attr("name")
+      temperatures = event:attr("temperatures")
+      
+      pastResponses = ent:reportResponses{[rcn, "Temperatures"]}
+      updatedResponses = pastResponses.put(sensorName, temperatures)
+      
+      numSensors = Subscription:established("Tx_role", "sensor").length().klog("Number of sensors:")
+      numResponses = (updatedResponses.length()).klog("Number of responses:")
+    }
+    
+    if numResponses == numSensors then noop()
+    
+    fired {
+      raise reports event "report_complete" attributes {"rcn": rcn}
+    } finally {
+      ent:reportResponses := ent:reportResponses.set([rcn, "Temperatures"], updatedResponses)
+    }
+    
+  }
+  
+  
+  rule collect_report_responses {
+    select when reports report_complete
+    pre {
+      rcn = event:attr("rcn").klog("RCN:")
+      temperatureResponses = ent:reportResponses{[rcn, "Temperatures"]}
+      numSensors = Subscription:established("Tx_role", "sensor").length().klog("Number of sensors:")
+      numResponses = (temperatureResponses.length()).klog("Number of responses:")
+      reportSent = ent:reportResponses{[rcn, "reportSent"]}.klog("Report Sent??:")
+      
+      report = {"temperature_sensors": numSensors, "responding": numResponses, "temperatures": [temperatureResponses]}
+    }
+    
+    if reportSent == false then send_directive("Report", report)
+    
+    fired {
+      ent:reportResponses := ent:reportResponses.set([rcn, "reportSent"], true)
+      ent:reports := ent:reports.defaultsTo([]).append({"Report ID": rcn, "Time": time:now(), "Report": report})
+      raise reports event "notify_report_ready"
+    }
+    
+  }
+}
+
